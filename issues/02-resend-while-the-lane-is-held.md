@@ -40,7 +40,7 @@ With it, the test passes in 5 of 5 runs (0.44-0.47 s). With the answer kept but 
 Checks with the patch, on the fake:
 
 - tests/test_a2a_failure.py, test_a2a_server.py, test_live_inbox.py: 12, 17 and 32 passed. In probes, a new message that waits still runs as its own task, under `interrupt` and `queue`.
-- tests/test_storage.py: 23 passed; B22's test fails as it does without the patch, for another reason (my comment on #8200). The whole unit suite has the same failures as without the patch.
+- tests/test_storage.py: 23 passed; B22's test fails as it does without the patch, for another reason ([my comment on #8200](https://github.com/livekit/agents/pull/8200#issuecomment-6618539267)). The whole unit suite has the same failures as without the patch.
 - `cargo test -p lk-agents-storage` (from rust/): the 52 unit tests pass; the 25 staging tests return early without a project. `cargo fmt --check` passes, and `cargo clippy -p lk-agents-storage` warns only at statements.rs:531, which the patch does not touch.
 
 You may prefer that a known duplicate not wait for the lane at all, as before a4cc2d783d, and await the existing task instead. That would also cover the first case below. I did not try it.

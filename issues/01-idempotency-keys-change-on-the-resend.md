@@ -26,7 +26,7 @@ ChargedAgain: one booking, charged under 2 keys: ['run_1d40aac81409 12', 'run_44
 4 failed, 5 deselected, 5 warnings in 24.90s
 ```
 
-The first two are the worker death, the last two the refused commit. The tests wait for the lease to lapse before they resend; while it is held, the same `messageId` hits a separate bug, which I reported on its own. In a checkout of 317f826, you can copy tests/test_lost_run_effects.py into tests/ instead of using run.sh.
+The first two are the worker death, the last two the refused commit. The tests wait for the lease to lapse before they resend; while it is held, the same `messageId` hits a separate bug, which I reported in [#8367](https://github.com/livekit/agents/issues/8367). In a checkout of 317f826, you can copy tests/test_lost_run_effects.py into tests/ instead of using run.sh.
 
 ### Questions
 

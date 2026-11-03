@@ -4,6 +4,8 @@ Tests and a patch for LiveKit Agents 2.0 at 317f826, the head of the agents-2.0 
 
 Independent project; not affiliated with LiveKit.
 
+Reported upstream: finding 1 as [livekit/agents#8367](https://github.com/livekit/agents/issues/8367); findings 2 and 5 in [a comment on #8200](https://github.com/livekit/agents/pull/8200#issuecomment-6618539267).
+
 ## Findings (code at 317f826)
 
 1. **A resend while the lane is held.** The same `messageId`, sent while its first send holds the lane, makes the first send yield at its next model call (`canceled`, `new-message`) and is acked under a task id that `tasks/get` cannot find. The first batch learns the message is a duplicate, but a batch that finds the lease held throws that answer away ([statements.rs:622-624](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/rust/crates/lk-agents-storage/src/statements.rs#L622-L624)), and the retry carries no row ([run.rs:473-474](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/rust/crates/lk-agents-storage/src/run.rs#L473-L474)). The duplicate also marks itself the lane's waiter ([run.rs:481-486](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/rust/crates/lk-agents-storage/src/run.rs#L481-L486)). Commit a4cc2d783d moved the `messageId` check after the lease. [The patch](patches/0001-resend-while-the-lane-is-held.patch) keeps the first answer, and a known duplicate waits unmarked.
