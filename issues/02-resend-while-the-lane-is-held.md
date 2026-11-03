@@ -7,7 +7,7 @@ docs/storage.md says a resend "returns the task the first send created, finished
 
 ### Test
 
-[`test_a_message_id_resent_while_its_turn_runs_returns_the_existing_task`](https://github.com/Dulatormanov/lost-run-effects/blob/main/tests/test_lost_run_effects.py#L541-L598) is a strict xfail. The first send's handler holds the lane on an `asyncio.Event`, then answers through an `Agent` with a scripted model. The same `messageId` goes out on a second request, and the handler is released once the resend has found the lease held twice (the test counts the acquire batches the fake answers).
+[`test_a_message_id_resent_while_its_turn_runs_returns_the_existing_task`](https://github.com/Dulatormanov/lost-run-effects/blob/ad0ba8ddb895599a1782689aecd5b9cd0929af67/tests/test_lost_run_effects.py#L541-L598) is a strict xfail. The first send's handler holds the lane on an `asyncio.Event`, then answers through an `Agent` with a scripted model. The same `messageId` goes out on a second request, and the handler is released once the resend has found the lease held twice (the test counts the acquire batches the fake answers).
 
 ```
 git clone https://github.com/Dulatormanov/lost-run-effects && cd lost-run-effects
@@ -29,7 +29,7 @@ The comment at run.rs:473 is right: a retry must not report a new message's own 
 
 ### Patch
 
-[patches/0001-resend-while-the-lane-is-held.patch](https://github.com/Dulatormanov/lost-run-effects/blob/main/patches/0001-resend-while-the-lane-is-held.patch), 2 files, +40/-14:
+[patches/0001-resend-while-the-lane-is-held.patch](https://github.com/Dulatormanov/lost-run-effects/blob/ad0ba8ddb895599a1782689aecd5b9cd0929af67/patches/0001-resend-while-the-lane-is-held.patch), 2 files, +40/-14:
 
 - `acquire_batch` returns `AcquireOutcome::Loaded(Box<Loaded>)` or `AcquireOutcome::Held { submitted }`, through a crate-private `try_acquire`. The public `acquire` keeps its signature, so the Python binding and the crate tests do not change.
 - `Lane::acquire` keeps the first batch's answer through the retries, and a known duplicate (`Some(false)`) polls without the waiter mark.
