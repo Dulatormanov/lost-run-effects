@@ -1,0 +1,365 @@
+diff --git a/docs/agents.md b/docs/agents.md
+index 15c3892..c64e8fd 100644
+--- a/docs/agents.md
++++ b/docs/agents.md
+@@ -86,9 +86,10 @@ Every tool, instruction function and validator receives
+ | `ctx.state` | the thread's typed state, loaded; mutate it in place |
+ | `ctx.thread` | the durable thread this run belongs to, the same object an `a2a_session` handler gets; see [threads.md](threads.md) |
+ | `ctx.live_session` | the `LiveSession` of the call, `None` outside a call |
+-| `ctx.task_id` | the A2A task id of the turn; the idempotency key for outside calls |
++| `ctx.task_id` | the A2A task id of the turn, new on every run |
+ | `ctx.usage` | token usage so far; pass it to a delegated `run(usage=ctx.usage)` |
+ | `ctx.function_call` | the call being executed, inside a tool |
++| `ctx.idempotency_key(ref)` | inside a tool, the key for an outside call: the same for this thread, tool and `ref` on every run; see [tools.md](tools.md#idempotency) |
+ | `await ctx.update(text)` | a progress message while the tool runs: a `working` frame on the text door, speech on a call |
+ 
+ On a call the context also carries the speech: `ctx.speech_handle`,
+diff --git a/docs/storage.md b/docs/storage.md
+index 1d08368..1e4050e 100644
+--- a/docs/storage.md
++++ b/docs/storage.md
+@@ -119,7 +119,7 @@ with `UpdateThread` and its `idle_ttl`.
+ ## The unit of work
+ 
+ A run is a unit of work: everything it reads and writes is committed
+-together when it ends, or not at all.
++together when it ends, or not at all, but for the calls it writes ahead.
+ 
+ - **Load.** Taking the lane's lease loads its history, state, agent stack and
+   journal events in one round trip. The whole history is loaded; compaction, when a
+@@ -130,11 +130,16 @@ together when it ends, or not at all.
+   fenced on the version loaded and the lease token, and releases the lease.
+   A run that lost its lease meanwhile gets `VersionConflict` and writes
+   nothing.
++- **Calls ahead.** In text, before a step's tools run, the run writes what
++  it added so far, the step's calls last, in one write outside the fence
++  that bumps no version; the commit writes the same items again. A run that
++  is lost leaves its calls, and the next run's model reads one that has no
++  result as not finished ([tools.md](tools.md#idempotency)).
+ - **Fail.** A run that raises writes only its `run_ended` event and
+   releases the lease.
+ - **A failed save** ends the task `failed` with `livekit/reason`
+-  `storage-unavailable`. Nothing of the run was written, and resending the
+-  message runs it again.
++  `storage-unavailable`. Nothing of the run was written but its calls, and
++  resending the message runs it again.
+ - **No double answers.** A message is identified by its `messageId`, unique
+   per lane: a resend returns the task the first send created, finished or
+   still running, and runs nothing new. A run id that already committed
+diff --git a/docs/tools.md b/docs/tools.md
+index a2f5893..26bfc9f 100644
+--- a/docs/tools.md
++++ b/docs/tools.md
+@@ -187,9 +187,19 @@ message is the answer, which the model reads
+ 
+ ## Idempotency
+ 
+-A tool may run again after a retry. Key every outside call on
+-`ctx.function_call.call_id` inside a conversation tool and on `ctx.task_id`
+-inside a task, so a repeated call is a no-op on the other side.
++A tool may run again after a retry, and in text a run may be lost after its
++tools ran: its worker died (`worker-lost`) or its save failed
++(`storage-unavailable`), and the client resends the message under a new
++`messageId`. A step's calls are in the thread before their tools run
++([storage.md](storage.md)), so the next run's model reads each call of the
++lost run that has no result as not finished, its outcome unknown.
++
++Key every outside call on `ctx.idempotency_key(ref)`, where `ref` names the
++effect, such as an order number or a room and its dates. The key is the same
++for the same thread, tool and `ref` on every run, so a call that a lost run
++made and the next run makes again is a no-op on the other side; two effects
++need two refs. `ctx.function_call.call_id` and `ctx.task_id` are new on every
++run.
+ 
+ Filtered and prefixed toolsets and `Agent(toolsets=)` are designed in
+ [planned-agents.md](planned-agents.md).
+diff --git a/livekit-agents/livekit/agents/storage/context.py b/livekit-agents/livekit/agents/storage/context.py
+index f9f2d0d..f42e5b4 100644
+--- a/livekit-agents/livekit/agents/storage/context.py
++++ b/livekit-agents/livekit/agents/storage/context.py
+@@ -10,7 +10,7 @@ takes, runs it with the run hooks of ``Agent.run()`` installed, and reports the
+ from __future__ import annotations
+ 
+ import time
+-from collections.abc import AsyncIterable, Awaitable, Callable
++from collections.abc import AsyncIterable, Awaitable, Callable, Container
+ from typing import Generic, cast
+ 
+ from pydantic import JsonValue
+@@ -228,6 +228,27 @@ class TurnHost(Generic[S]):
+                     progress.append(item)
+             context.message_history.insert(progress)
+ 
++        # how many of ``added`` the lane holds already, ``progress`` with the first, and the
++        # calls whose start the journal has
++        written = 0
++        ahead: set[str] = set()
++
++        async def write_ahead() -> None:
++            # what the turn would commit so far, the step's calls last, goes to the lane before
++            # their tools run; the commit writes it again, as upserts on the items' ids
++            nonlocal written
++            new = added[written:]
++            items = new if written else [*progress, *new]
++            written = len(added)
++            calls = [item for item in new if isinstance(item, FunctionCall)]
++            ahead.update(call.call_id for call in calls)
++            await self._thread._write_ahead(
++                ctx.task_id,
++                [item_to_payload(item) for item in sorted(items, key=lambda i: i.created_at)],
++                [_tool_event("started", callId=c.call_id, name=c.name) for c in calls],
++            )
++
++        hooks.write_ahead = write_ahead
+         token = set_run_hooks(hooks)
+         try:
+             handled = self._handler(context)
+@@ -258,7 +279,7 @@ class TurnHost(Generic[S]):
+             reset_run_hooks(token)
+             hooks.close()
+ 
+-        handled_output = self._output(context, output, results)
++        handled_output = self._output(context, output, results, ahead)
+         handled_output.new_items[:0] = [item_to_payload(item) for item in progress]
+         return handled_output
+ 
+@@ -294,10 +315,14 @@ class TurnHost(Generic[S]):
+         return load_state(stored, self._state_type)
+ 
+     def _output(
+-        self, ctx: A2ASessionContext[S], output: object, results: list[RunResult[object]]
++        self,
++        ctx: A2ASessionContext[S],
++        output: object,
++        results: list[RunResult[object]],
++        ahead: Container[str] = (),
+     ) -> HandlerOutput:
+         """What the turn commits: the answer, what the runs added, the state, the ask, the
+-        agent stack when a run moved it."""
++        agent stack when a run moved it; the journal has the start of each call in ``ahead``."""
+         if isinstance(output, RunResult):
+             # a run returned as is answers with its question while it waits, else its output
+             output = output.input_required if output.input_required is not None else output.output
+@@ -331,17 +356,19 @@ class TurnHost(Generic[S]):
+             # the task waits for its tools in the background, whose end answers it
+             background=ctx.task_id in self._tools.owed(),
+             metadata=dict(ctx.metadata),
+-            events=[*_tool_events(results), *ctx.events],
++            events=[*_tool_events(results, ahead), *ctx.events],
+         )
+ 
+ 
+-def _tool_events(results: list[RunResult[object]]) -> list[HostEvent]:
+-    """Each call's start and end as the runs' results hold them (docs/journal.md)."""
++def _tool_events(results: list[RunResult[object]], ahead: Container[str] = ()) -> list[HostEvent]:
++    """Each call's start and end as the runs' results hold them (docs/journal.md), but the start
++    of a call in ``ahead``, which its write ahead journaled."""
+     events: list[HostEvent] = []
+     for result in results:
+         for item in result.new_messages():
+             if isinstance(item, FunctionCall):
+-                events.append(_tool_event("started", callId=item.call_id, name=item.name))
++                if item.call_id not in ahead:
++                    events.append(_tool_event("started", callId=item.call_id, name=item.name))
+             elif isinstance(item, FunctionCallOutput):
+                 events.append(
+                     _tool_event("ended", callId=item.call_id, name=item.name, isError=item.is_error)
+diff --git a/livekit-agents/livekit/agents/storage/resolve.py b/livekit-agents/livekit/agents/storage/resolve.py
+index a5b1064..8fdd21f 100644
+--- a/livekit-agents/livekit/agents/storage/resolve.py
++++ b/livekit-agents/livekit/agents/storage/resolve.py
+@@ -18,9 +18,10 @@ from pydantic import JsonValue
+ 
+ from .. import _core, utils
+ from .._core import Threads
+-from .._generated.storage import CommitRequest, EventRow, EventWrite, TaskWrite
++from .._generated.storage import CommitRequest, EventRow, EventWrite, ItemWrite, TaskWrite
+ from .._generated.storage_run import Ref, TaskRecord
+ from .._generated.storage_threads import ThreadInfo
++from .._generated.storage_turn import HostEvent
+ from ..llm import ChatContext
+ from ..log import logger
+ from .agentdb import AgentDBStorage
+@@ -241,6 +242,28 @@ class Thread:
+         finally:
+             db.close()
+ 
++    async def _write_ahead(
++        self, run_id: str, items: list[dict[str, JsonValue]], events: list[HostEvent]
++    ) -> None:
++        """What a run added so far, in its lane before its commit: an unfenced commit, as
++        ``cancel`` makes, of the items as upserts on their ids, which the run's own commit
++        writes again. It bumps no version, so that commit's fence still holds. ``events`` go to
++        the journal; the last takes the place of ``run_ended``, which an unfenced commit writes."""
++        *journal, last = [self._event(e.type, e.payload) for e in events]
++        db = await self._storage.open(self._id)
++        try:
++            await db.commit(
++                CommitRequest(
++                    lane=self._agent_name,
++                    run_id=run_id,
++                    items=[ItemWrite(id=str(item["id"]), payload=item) for item in items],
++                    events=journal,
++                    run_ended=last,
++                )
++            )
++        finally:
++            db.close()
++
+     async def request_cancel(self, record: TaskRecord, request: dict[str, JsonValue]) -> bool:
+         """``tasks/cancel`` on a running task: ``request`` for its holder, off the wire; ``False``
+         when the task no longer runs."""
+diff --git a/livekit-agents/livekit/agents/voice/agent_run.py b/livekit-agents/livekit/agents/voice/agent_run.py
+index b91d27d..c0f3ea8 100644
+--- a/livekit-agents/livekit/agents/voice/agent_run.py
++++ b/livekit-agents/livekit/agents/voice/agent_run.py
+@@ -116,6 +116,13 @@ _FINAL_RESULT_PROMPT = (
+     f"You have not provided the final output yet. Call `{FINAL_RESULT_TOOL}` with it; "
+     "a plain text response alone is not enough."
+ )
++UNFINISHED_CALL = (
++    "(This call has no result: the run that made it did not finish, so whether it took effect "
++    "is unknown. If that matters, find out before you make the call again.)"
++)
++"""What the model reads in a door's turn as the output of a call that has none and that no task
++waits on: a call that a run wrote ahead of its tool and did not finish, a lost run's
++(docs/storage.md). The history keeps the call as it is."""
+ 
+ 
+ @dataclass
+@@ -126,6 +133,8 @@ class RunHooks:
+     runs; ``True`` makes the run yield, and ``canceled`` says a client canceled the task. ``on_result`` receives every
+     result, so the door can commit what the run added without the handler forwarding it;
+     ``on_item`` each item as the run adds it, so a run that raises still commits what it ran.
++    ``write_ahead`` puts what the run added so far in the thread before a step's tools run,
++    outside the fence, so a run lost after them still leaves its calls (docs/storage.md).
+     ``on_update`` receives a tool's ``ctx.update(text)``: the door forwards it as progress, a
+     ``working`` frame on the text door. ``on_say`` receives exact text said during the run, a
+     ``ctx.say(text)`` or a verbatim result the model goes on from: the door sends it at once as
+@@ -148,6 +157,7 @@ class RunHooks:
+     boundary: Callable[[], Awaitable[bool]] | None = None
+     on_result: Callable[[RunResult[Any]], None] | None = None
+     on_item: Callable[[ChatItem], None] | None = None
++    write_ahead: Callable[[], Awaitable[None]] | None = None
+     on_update: Callable[[str], Any] | None = None
+     on_say: Callable[[str], Any] | None = None
+     on_token: Callable[[str], Awaitable[None]] | None = None
+@@ -616,6 +626,14 @@ class AgentRun(Generic[Run_T]):
+             for a in self._stack
+         ]
+ 
++    def _waited_on(self) -> frozenset[str]:
++        """The calls a task on the stack waits on, which have no output until it ends."""
++        return frozenset(
++            a._pending_call_id
++            for a in self._stack
++            if isinstance(a, AgentTask) and a._pending_call_id is not None
++        )
++
+     def _hand_off(self, agent: Agent, record: Callable[[ChatItem], None]) -> None:
+         """A tool returned an agent: it speaks from the next step, on the same history."""
+         record(AgentHandoff(old_agent_id=self._agent.id, new_agent_id=agent.id))
+@@ -898,7 +916,10 @@ class AgentRun(Generic[Run_T]):
+                 text, calls = "", [c for c, _ in handed]
+             else:
+                 on_token = self._on_token or (hooks.on_token if hooks is not None else None)
+-                request = _without_pending_calls(chat_ctx, self._hidden)
++                # in a door's turn, a call with no output that no task waits on is from a run that
++                # did not finish
++                waiting = self._waited_on() if hooks is not None else None
++                request = _without_pending_calls(chat_ctx, self._hidden, waiting)
+                 note_cut_off_replies(request)
+                 if hint is not None:
+                     # as on a call: told last, next to what it is about, and not recorded
+@@ -953,6 +974,10 @@ class AgentRun(Generic[Run_T]):
+             for fnc_call in calls:
+                 self._usage.tool_calls += 1
+                 record(fnc_call)
++            if hooks is not None and hooks.write_ahead is not None:
++                # the calls are in the thread before their tools run: a run lost from here on
++                # leaves them, and the next run's model reads them as unfinished
++                await hooks.write_ahead()
+             # a verbatim result the model goes on from is said when its tool returns; one that
+             # ends the turn waits for the other calls, as whether it is the answer depends on them
+             running = {
+@@ -1341,18 +1366,29 @@ class AgentRun(Generic[Run_T]):
+ 
+ 
+ def _without_pending_calls(
+-    chat_ctx: ChatContext, hidden: frozenset[str] = frozenset()
++    chat_ctx: ChatContext,
++    hidden: frozenset[str] = frozenset(),
++    waiting: Container[str] | None = None,
+ ) -> ChatContext:
+     """The history as the model reads it: a call still waiting on a task has no output yet,
+-    and a request cannot carry one, so it is left out until the task completes; an answered
+-    read-back says the call has not run; the ``hidden`` items of other open tasks are left out."""
++    and a request cannot carry one, so it is left out until the task completes; in a door's
++    turn, where ``waiting`` are those calls, any other call with no output is from a run that
++    did not finish, and reads ``UNFINISHED_CALL``; an answered read-back says the call has not
++    run; the ``hidden`` items of other open tasks are left out."""
+     answered = {item.call_id for item in chat_ctx.items if isinstance(item, FunctionCallOutput)}
+-    pending = [
+-        item
+-        for item in chat_ctx.items
+-        if isinstance(item, FunctionCall) and item.call_id not in answered
+-    ]
+-    kept = [item for item in chat_ctx.items if item not in pending and item.id not in hidden]
++    kept: list[ChatItem] = []
++    for item in chat_ctx.items:
++        if item.id in hidden:
++            continue
++        if isinstance(item, FunctionCall) and item.call_id not in answered:
++            if waiting is None or item.call_id in waiting:
++                continue
++            unfinished = FunctionCallOutput(
++                name=item.name, call_id=item.call_id, output=UNFINISHED_CALL, is_error=True
++            )
++            kept += [item, unfinished]
++            continue
++        kept.append(item)
+     return ChatContext(as_model_reads(kept))
+ 
+ 
+diff --git a/livekit-agents/livekit/agents/voice/events.py b/livekit-agents/livekit/agents/voice/events.py
+index 31dddf1..4e813b8 100644
+--- a/livekit-agents/livekit/agents/voice/events.py
++++ b/livekit-agents/livekit/agents/voice/events.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import functools
++import hashlib
+ import time
+ from collections.abc import AsyncIterator, Callable, Iterator
+ from contextlib import asynccontextmanager, contextmanager
+@@ -158,7 +159,8 @@ class RunContext(Generic[Deps_T, State_T]):
+ 
+     @property
+     def task_id(self) -> str:
+-        """The id of this run, also the idempotency key for outside calls.
++        """The id of this run, new on every run: an outside call is keyed on
++        ``idempotency_key``, which a resend keeps.
+ 
+         TODO(agents-2.0): the A2A task id once the turn is a task row (plan 5.5); a fresh id
+         per run, and per speech on a call, until then.
+@@ -184,6 +186,19 @@ class RunContext(Generic[Deps_T, State_T]):
+             raise RuntimeError("no function call: this RunContext is not running a tool")
+         return self._function_call
+ 
++    def idempotency_key(self, ref: str) -> str:
++        """The key to send with an outside call, inside a tool: the same for the same thread,
++        tool and ``ref`` on every run, so a call that a lost run made and the next run makes
++        again, under a new ``messageId``, is a no-op on the other side. ``ref`` names the
++        effect, such as an order number or a room and its dates; two effects need two refs.
++        Outside a text door's turn there is no thread, and the key holds as ``task_id`` does."""
++        from .agent_run import current_run_hooks
++
++        hooks = current_run_hooks()
++        scope = hooks.thread_id if hooks is not None and hooks.thread_id else self.task_id
++        named = "\0".join((scope, self.function_call.name, ref))
++        return hashlib.sha256(named.encode()).hexdigest()[:32]
++
+     @property
+     def userdata(self) -> Deps_T:
+         """The session's ``userdata``, the pre 2.0 name for what ``deps`` carries now."""

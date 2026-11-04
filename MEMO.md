@@ -15,17 +15,9 @@ I tested the agents-2.0 stack at 317f826 (#8200 to #8256) inside LiveKit's test 
 
 A booking or payments agent keys its outside call on `call_id` or `ctx.task_id`. After a crash the docs say to resend; the same `messageId` runs nothing, and a new one brings new keys. My models book whenever they read no booking: the tests show that a second charge can happen, not that a real model will make it.
 
-## A design sketch (not tried)
+## A design, built and measured
 
-Record an outside effect before it is made, outside the fence, the way `Thread.cancel` commits unfenced (storage/resolve.py:215-242):
-
-    key = await ctx.effect("charge", ref=f"room-{room}")
-    await provider.charge(room, idempotency_key=key)
-
-- `ctx.effect` appends `{name, ref, key, run}` to the thread and returns the key. It costs one round trip per outside call, and the record outlives a lost run.
-- A later run with the same `name` and `ref` gets the same key, even under a new `messageId`, so the provider dedupes. The tool picks `ref`, so two real bookings stay two.
-- The next run's model reads an effect with no result as a tool output, "charge for room-12 started, outcome unknown", and can ask the provider by key.
-- The docs could then promise: a repeated outside call in a thread reuses its key.
+[DESIGN.md](DESIGN.md) and [patches/0002](patches/0002-calls-ahead-and-stable-keys.patch): a run writes a step's tool calls to the thread before their tools run, outside the fence, the way `Thread.cancel` commits unfenced (storage/resolve.py:215-242), and the next run's model reads a lost run's call as unfinished. `ctx.idempotency_key(ref)` hashes the thread, the tool and a ref the tool picks, so a model that books again anyway charges once. On the fake it costs one batch per step that calls tools.
 
 ## Questions
 

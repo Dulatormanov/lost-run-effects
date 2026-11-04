@@ -1,6 +1,6 @@
 # lost-run-effects
 
-Tests and a patch for LiveKit Agents 2.0 at 317f826, the head of the agents-2.0 PR stack ([#8200](https://github.com/livekit/agents/pull/8200) to [#8256](https://github.com/livekit/agents/pull/8256)). They run inside LiveKit's own test suite, on its fake store, with scripted models: no API keys or real model calls. [MEMO.md](MEMO.md): one page, with a design sketch.
+Tests and two patches for LiveKit Agents 2.0 at 317f826, the head of the agents-2.0 PR stack ([#8200](https://github.com/livekit/agents/pull/8200) to [#8256](https://github.com/livekit/agents/pull/8256)). They run inside LiveKit's own test suite, on its fake store, with scripted models: no API keys or real model calls. [MEMO.md](MEMO.md): one page.
 
 Independent project; not affiliated with LiveKit.
 
@@ -18,18 +18,23 @@ One failure, as `--runxfail` shows it:
 
     ChargedAgain: one booking, charged under 2 keys: ['call_fbb8d80a314a 12', 'call_b6f123e822ee 12']
 
+## Part 2: a prototype
+
+[Patch 0002](patches/0002-calls-ahead-and-stable-keys.patch) writes a step's tool calls to the thread before their tools run, and adds `ctx.idempotency_key(ref)`. A lost run's call then reaches the next model, and a model that books again anyway charges once (tests/test_effect_prototype.py). It costs one batch per step that calls tools ([DESIGN.md](DESIGN.md)).
+
 ## Results
 
 | test | finding | 317f826 | patched |
 |---|---|---|---|
 | model down after the charge (`call_id`, `task_id`) | 3, control | 2 passed | 2 passed |
-| worker killed after the charge (`call_id`, `task_id`) | 3 | 2 xfailed | 2 xfailed |
-| commit refused after the charge (`call_id`, `task_id`) | 3 | 2 xfailed | 2 xfailed |
+| worker killed after the charge (`call_id`, `task_id`) | 3 | 2 xfailed | 2 pass (XPASS strict) |
+| commit refused after the charge (`call_id`, `task_id`) | 3 | 2 xfailed | 2 pass (XPASS strict) |
 | worker killed answering an `AgentTask`'s question | 4 | xfailed | xfailed |
 | worker dies while the question waits | 4, control | passed | passed |
 | same `messageId` while the lane is held | 1 | xfailed | passes (XPASS strict) |
+| part 2: books again after each of the three, and five checks | 3 | not run (needs 0002) | 8 passed |
 
-Each xfail is strict, with its own exception. The markers reuse ids from LiveKit's tests: R3, "a resend runs nothing new" ([test_a2a_server.py:386](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/tests/test_a2a_server.py#L386)); R16, "a dead worker's task fails `worker-lost`" ([test_a2a_failure.py:218](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/tests/test_a2a_failure.py#L218)); B3, #8202's fix. LiveKit's checklist is not public, so the ids are my reading; finding 3's xfails carry none.
+Patched: both patches, as `./run.sh --patched` applies them. Each xfail is strict, with its own exception. The markers reuse ids from LiveKit's tests: R3, "a resend runs nothing new" ([test_a2a_server.py:386](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/tests/test_a2a_server.py#L386)); R16, "a dead worker's task fails `worker-lost`" ([test_a2a_failure.py:218](https://github.com/livekit/agents/blob/317f826957239e255dd67dd162c83b4cac6b072b/tests/test_a2a_failure.py#L218)); B3, #8202's fix. LiveKit's checklist is not public, so the ids are my reading; finding 3's xfails carry none.
 
 ## Run it
 
@@ -38,9 +43,9 @@ In a LiveKit Agents checkout at 317f826:
     cp tests/test_lost_run_effects.py <checkout>/tests/
     cd <checkout> && uv run pytest tests/test_lost_run_effects.py -p no:cacheprovider
 
-Expected: "3 passed, 6 xfailed", about 31 s; `--runxfail` shows each failure. With the patch applied and built (`git apply`, `uv sync --all-extras --dev`), `-k resent_while --runxfail` gives "1 passed".
+Expected: "3 passed, 6 xfailed", about 31 s; `--runxfail` shows each failure. With the patches applied and built (`git apply`, `uv sync --all-extras --dev`), `-k resent_while --runxfail` gives "1 passed", and tests/test_effect_prototype.py "8 passed".
 
-From zero, `./run.sh` clones and builds 317f826 into vendor/agents, then runs that command; pytest arguments follow. It needs git 2.49+, uv, Rust and network (about 14 min here the first time). `./run.sh --patched -k resent_while --runxfail` does the same in vendor/agents-patched, with the patch. After a failed build, delete that checkout's .venv.
+From zero, `./run.sh` clones and builds 317f826 into vendor/agents, then runs that command; pytest arguments follow. It needs git 2.49+, uv, Rust and network (about 14 min here the first time). `./run.sh --patched -k resent_while --runxfail` does the same in vendor/agents-patched, with the patches and the part 2 file. After a failed build, delete that checkout's .venv.
 
 ## What it doesn't show
 
