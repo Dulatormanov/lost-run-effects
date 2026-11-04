@@ -4,7 +4,7 @@ Tests and two patches for LiveKit Agents 2.0 at 317f826, the head of the agents-
 
 Independent project; not affiliated with LiveKit.
 
-Reported upstream: finding 1 as [livekit/agents#8367](https://github.com/livekit/agents/issues/8367); findings 2 and 5 in [a comment on #8200](https://github.com/livekit/agents/pull/8200#issuecomment-6618539267).
+Reported upstream: finding 1 as [livekit/agents#8367](https://github.com/livekit/agents/issues/8367); findings 2 and 5 in [a comment on #8200](https://github.com/livekit/agents/pull/8200#issuecomment-6618539267); finding 3 in [a comment on #8202](https://github.com/livekit/agents/pull/8202#issuecomment-6627975491); finding 4 in [a review comment on #8255](https://github.com/livekit/agents/pull/8255#discussion_r4466170827).
 
 ## Findings (code at 317f826)
 
